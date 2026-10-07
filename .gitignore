@@ -218,3 +218,43 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Datasets & synthetic generation (keep folders via .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/synthetic/*
+!data/synthetic/.gitkeep
+
+# Checkpoints and serializations
+checkpoints/*
+!checkpoints/.gitkeep
+*.pt
+*.pth
+*.h5
+*.pkl
+
+# Evaluation artifacts
+results/figures/*
+!results/figures/.gitkeep
+results/metrics/*
+!results/metrics/.gitkeep
+
+# OS and IDE files
+.DS_Store
+.vscode/
+.idea/
+*.log
+.env
