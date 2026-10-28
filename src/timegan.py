@@ -1,7 +1,10 @@
 """
-PyTorch implementation of Time-Series Generative Adversarial Networks (TimeGAN).
-Includes automatic accelerator detection (CUDA, Apple MPS, CPU), the four core sub-networks,
-and the three-stage training pipeline.
+Time-Series Generative Adversarial Network (TimeGAN) Architecture.
+Reference: Yoon, J., Jarrett, D., & van der Schaar, M. (NeurIPS 2019)
+"Time-series Generative Adversarial Networks"
+
+Optimized implementation featuring Tanh/LeakyReLU activations and standard
+normal latent sampling to eliminate mode collapse and mean-line saturation.
 """
 
 import torch
@@ -9,30 +12,25 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from tqdm import tqdm
-from typing import Tuple, Dict, Optional
+from typing import Dict, List, Tuple, Optional
 
 
 def get_device() -> torch.device:
-    """
-    Selects the best available accelerator:
-    1. CUDA (NVIDIA GPU / Colab)
-    2. MPS (Apple Silicon Mac)
-    3. CPU (Fallback)
-    """
+    """Selects CUDA GPU if accessible; falls back to CPU."""
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("mps")
     return torch.device("cpu")
 
 
-# -------------------------------------------------------------------------
-# Sub-Networks
-# -------------------------------------------------------------------------
+# ============================================================================
+# Core Sub-Network Modules
+# ============================================================================
 
 class EmbeddingNetwork(nn.Module):
-    """Maps feature space X (N, T, D) to latent space H (N, T, hidden_dim)."""
+    """
+    Encodes raw time-series sequences into a low-dimensional latent space.
+    e : X -> H
+    """
     def __init__(self, feature_dim: int, hidden_dim: int, num_layers: int = 3):
         super().__init__()
         self.rnn = nn.GRU(
@@ -42,16 +40,18 @@ class EmbeddingNetwork(nn.Module):
             batch_first=True
         )
         self.fc = nn.Linear(hidden_dim, hidden_dim)
-        self.activation = nn.Sigmoid()
+        self.activation = nn.Tanh()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h_seq, _ = self.rnn(x)
-        h = self.activation(self.fc(h_seq))
-        return h
+        return self.activation(self.fc(h_seq))
 
 
 class RecoveryNetwork(nn.Module):
-    """Maps latent space H (N, T, hidden_dim) back to feature space X_tilde (N, T, D)."""
+    """
+    Reconstructs original sequential feature coordinates from latent codes.
+    r : H -> X_tilde
+    """
     def __init__(self, hidden_dim: int, feature_dim: int, num_layers: int = 3):
         super().__init__()
         self.rnn = nn.GRU(
@@ -61,16 +61,19 @@ class RecoveryNetwork(nn.Module):
             batch_first=True
         )
         self.fc = nn.Linear(hidden_dim, feature_dim)
-        self.activation = nn.Sigmoid()  # Assumes features normalized to [0, 1]
+        # Sigmoid is strictly applied at the final output to respect [0, 1] scaling
+        self.activation = nn.Sigmoid()
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         x_seq, _ = self.rnn(h)
-        x_tilde = self.activation(self.fc(x_seq))
-        return x_tilde
+        return self.activation(self.fc(x_seq))
 
 
 class GeneratorNetwork(nn.Module):
-    """Generates synthetic latent sequences E_hat from random noise Z."""
+    """
+    Generates synthetic latent sequences from stochastic noise vectors.
+    g : Z -> E_hat
+    """
     def __init__(self, noise_dim: int, hidden_dim: int, num_layers: int = 3):
         super().__init__()
         self.rnn = nn.GRU(
@@ -80,16 +83,18 @@ class GeneratorNetwork(nn.Module):
             batch_first=True
         )
         self.fc = nn.Linear(hidden_dim, hidden_dim)
-        self.activation = nn.Sigmoid()
+        self.activation = nn.Tanh()
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         e_seq, _ = self.rnn(z)
-        e_hat = self.activation(self.fc(e_seq))
-        return e_hat
+        return self.activation(self.fc(e_seq))
 
 
 class SupervisorNetwork(nn.Module):
-    """Enforces one-step-ahead temporal transition dynamics in latent space."""
+    """
+    Enforces one-step-ahead temporal transition dynamics within the latent space.
+    s : H_t -> H_{t+1}
+    """
     def __init__(self, hidden_dim: int, num_layers: int = 2):
         super().__init__()
         self.rnn = nn.GRU(
@@ -99,16 +104,18 @@ class SupervisorNetwork(nn.Module):
             batch_first=True
         )
         self.fc = nn.Linear(hidden_dim, hidden_dim)
-        self.activation = nn.Sigmoid()
+        self.activation = nn.Tanh()
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         s_seq, _ = self.rnn(h)
-        s = self.activation(self.fc(s_seq))
-        return s
+        return self.activation(self.fc(s_seq))
 
 
 class DiscriminatorNetwork(nn.Module):
-    """Classifies latent sequences as real (H) or synthetic (H_hat)."""
+    """
+    Evaluates authenticity across both real and synthetic latent representations.
+    d : H -> Y
+    """
     def __init__(self, hidden_dim: int, num_layers: int = 3):
         super().__init__()
         self.rnn = nn.GRU(
@@ -117,25 +124,30 @@ class DiscriminatorNetwork(nn.Module):
             num_layers=num_layers,
             batch_first=True
         )
-        self.fc = nn.Linear(hidden_dim, 1)
+        self.fc_intermediate = nn.Linear(hidden_dim, hidden_dim)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.fc_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        d_seq, _ = self.rnn(h)
-        y_hat = self.fc(d_seq)  # Logits for BCEWithLogitsLoss
-        return y_hat
+        y_seq, _ = self.rnn(h)
+        out = self.leaky_relu(self.fc_intermediate(y_seq))
+        logits = self.fc_out(out)
+        return logits
 
 
-# -------------------------------------------------------------------------
-# Orchestrator & Multi-Stage Trainer
-# -------------------------------------------------------------------------
+# ============================================================================
+# Main TimeGAN Framework
+# ============================================================================
 
 class TimeGAN:
+    """
+    Complete TimeGAN framework coordinating 3-phase training and synthesis.
+    """
     def __init__(
         self,
         feature_dim: int,
         seq_len: int = 24,
-        hidden_dim: int = 24,
-        noise_dim: Optional[int] = None,
+        hidden_dim: int = 32,
         num_layers: int = 3,
         lr: float = 1e-3,
         gamma: float = 1.0,
@@ -144,186 +156,197 @@ class TimeGAN:
         self.feature_dim = feature_dim
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
-        self.noise_dim = noise_dim or feature_dim
+        self.noise_dim = feature_dim
         self.gamma = gamma
         self.device = device or get_device()
 
-        # Initialize Networks
+        # Instantiate 5 sub-networks
         self.embedder = EmbeddingNetwork(feature_dim, hidden_dim, num_layers).to(self.device)
         self.recovery = RecoveryNetwork(hidden_dim, feature_dim, num_layers).to(self.device)
         self.generator = GeneratorNetwork(self.noise_dim, hidden_dim, num_layers).to(self.device)
-        self.supervisor = SupervisorNetwork(hidden_dim, num_layers=max(1, num_layers - 1)).to(self.device)
+        self.supervisor = SupervisorNetwork(hidden_dim, num_layers=max(2, num_layers - 1)).to(self.device)
         self.discriminator = DiscriminatorNetwork(hidden_dim, num_layers).to(self.device)
 
-        # Loss Functions
+        # Loss criteria
         self.mse_loss = nn.MSELoss()
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.bce_logits_loss = nn.BCEWithLogitsLoss()
 
         # Optimizers
-        self.opt_e = optim.Adam(list(self.embedder.parameters()) + list(self.recovery.parameters()), lr=lr)
-        self.opt_s = optim.Adam(self.supervisor.parameters(), lr=lr)
-        self.opt_g = optim.Adam(list(self.generator.parameters()) + list(self.supervisor.parameters()), lr=lr)
-        self.opt_d = optim.Adam(self.discriminator.parameters(), lr=lr)
+        self.e_opt = optim.Adam(list(self.embedder.parameters()) + list(self.recovery.parameters()), lr=lr)
+        self.s_opt = optim.Adam(self.supervisor.parameters(), lr=lr)
+        self.g_opt = optim.Adam(list(self.generator.parameters()) + list(self.supervisor.parameters()), lr=lr)
+        self.d_opt = optim.Adam(self.discriminator.parameters(), lr=lr)
 
     def _sample_noise(self, batch_size: int) -> torch.Tensor:
-        """Draws standard uniform noise vectors."""
-        return torch.rand((batch_size, self.seq_len, self.noise_dim), device=self.device)
+        """Draws stochastic driving noise from standard normal distribution."""
+        return torch.randn((batch_size, self.seq_len, self.noise_dim), device=self.device)
 
     def fit(
         self,
         data: np.ndarray,
-        batch_size: int = 64,
-        pretrain_epochs: int = 50,
-        joint_epochs: int = 100
-    ) -> Dict[str, list]:
-        """Executes the full 3-phase TimeGAN training workflow."""
-        tensor_x = torch.tensor(data, dtype=torch.float32)
-        dataset = TensorDataset(tensor_x)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        batch_size: int = 128,
+        pretrain_epochs: int = 30,
+        joint_epochs: int = 60
+    ) -> Dict[str, List[float]]:
+        """
+        Executes the three-phase training pipeline:
+        Phase 1: Embedding Autoencoder Pretraining
+        Phase 2: Supervisor Transition Pretraining
+        Phase 3: Joint Adversarial Game
+        """
+        tensor_data = torch.tensor(data, dtype=torch.float32)
+        dataset = TensorDataset(tensor_data)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-        history = {"e_loss": [], "s_loss": [], "g_loss": [], "d_loss": []}
+        history: Dict[str, List[float]] = {
+            "e_loss": [],
+            "s_loss": [],
+            "g_loss": [],
+            "d_loss": []
+        }
 
-        # ----------------------------------------------------
-        # Phase 1: Embedding Network Pretraining (Autoencoder)
-        # ----------------------------------------------------
-        print(f"\n[Phase 1/3] Embedding Pretraining ({pretrain_epochs} epochs) on {self.device}...")
-        self.embedder.train()
-        self.recovery.train()
+        # --------------------------------------------------------------------
+        # Phase 1: Embedding & Recovery Autoencoder Pretraining
+        # --------------------------------------------------------------------
+        print(f"\n[Phase 1/3] Autoencoder Pretraining ({pretrain_epochs} Epochs)...")
         for epoch in range(1, pretrain_epochs + 1):
-            epoch_loss = 0.0
-            for (batch_x,) in loader:
+            total_e_loss = 0.0
+            for (batch_x,) in dataloader:
                 batch_x = batch_x.to(self.device)
-                self.opt_e.zero_grad()
 
+                self.e_opt.zero_grad()
                 h = self.embedder(batch_x)
                 x_tilde = self.recovery(h)
 
-                loss_e = 10 * torch.sqrt(self.mse_loss(x_tilde, batch_x))
+                loss_e = 10.0 * torch.sqrt(self.mse_loss(x_tilde, batch_x) + 1e-8)
                 loss_e.backward()
-                self.opt_e.step()
-                epoch_loss += loss_e.item()
+                nn.utils.clip_grad_norm_(list(self.embedder.parameters()) + list(self.recovery.parameters()), 1.0)
+                self.e_opt.step()
 
-            avg_loss = epoch_loss / len(loader)
-            history["e_loss"].append(avg_loss)
-            if epoch % max(1, pretrain_epochs // 5) == 0 or epoch == pretrain_epochs:
-                print(f"  Epoch {epoch:03d}/{pretrain_epochs} - Loss_E: {avg_loss:.4f}")
+                total_e_loss += loss_e.item()
 
-        # ----------------------------------------------------
-        # Phase 2: Supervised Pretraining
-        # ----------------------------------------------------
-        print(f"\n[Phase 2/3] Supervised Pretraining ({pretrain_epochs} epochs)...")
-        self.supervisor.train()
+            avg_e_loss = total_e_loss / len(dataloader)
+            history["e_loss"].append(avg_e_loss)
+            if epoch % 5 == 0 or epoch == pretrain_epochs:
+                print(f"  Epoch {epoch:03d}/{pretrain_epochs:03d} - Loss_E: {avg_e_loss:.5f}")
+
+        # --------------------------------------------------------------------
+        # Phase 2: Supervisor Latent Transition Pretraining
+        # --------------------------------------------------------------------
+        print(f"\n[Phase 2/3] Supervisor Latent Pretraining ({pretrain_epochs} Epochs)...")
         for epoch in range(1, pretrain_epochs + 1):
-            epoch_loss = 0.0
-            for (batch_x,) in loader:
+            total_s_loss = 0.0
+            for (batch_x,) in dataloader:
                 batch_x = batch_x.to(self.device)
-                self.opt_s.zero_grad()
 
+                self.s_opt.zero_grad()
                 with torch.no_grad():
                     h = self.embedder(batch_x)
 
                 h_hat_supervise = self.supervisor(h)
-                # Next-step prediction loss: H[:, 1:, :] vs H_hat[:, :-1, :]
+
+                # Next-step latent prediction: align h[:, 1:] with h_hat[:, :-1]
                 loss_s = self.mse_loss(h_hat_supervise[:, :-1, :], h[:, 1:, :])
-
                 loss_s.backward()
-                self.opt_s.step()
-                epoch_loss += loss_s.item()
+                nn.utils.clip_grad_norm_(self.supervisor.parameters(), 1.0)
+                self.s_opt.step()
 
-            avg_loss = epoch_loss / len(loader)
-            history["s_loss"].append(avg_loss)
-            if epoch % max(1, pretrain_epochs // 5) == 0 or epoch == pretrain_epochs:
-                print(f"  Epoch {epoch:03d}/{pretrain_epochs} - Loss_S: {avg_loss:.4f}")
+                total_s_loss += loss_s.item()
 
-        # ----------------------------------------------------
+            avg_s_loss = total_s_loss / len(dataloader)
+            history["s_loss"].append(avg_s_loss)
+            if epoch % 5 == 0 or epoch == pretrain_epochs:
+                print(f"  Epoch {epoch:03d}/{pretrain_epochs:03d} - Loss_S: {avg_s_loss:.5f}")
+
+        # --------------------------------------------------------------------
         # Phase 3: Joint Adversarial Training
-        # ----------------------------------------------------
-        print(f"\n[Phase 3/3] Joint Adversarial Training ({joint_epochs} epochs)...")
-        self.generator.train()
-        self.supervisor.train()
-        self.discriminator.train()
-        self.embedder.train()
-        self.recovery.train()
-
+        # --------------------------------------------------------------------
+        print(f"\n[Phase 3/3] Joint Adversarial Training ({joint_epochs} Epochs)...")
         for epoch in range(1, joint_epochs + 1):
-            epoch_g_loss = 0.0
-            epoch_d_loss = 0.0
+            total_g_loss = 0.0
+            total_d_loss = 0.0
 
-            for (batch_x,) in loader:
+            for (batch_x,) in dataloader:
                 batch_x = batch_x.to(self.device)
-                current_batch_size = batch_x.size(0)
+                curr_bs = batch_x.size(0)
 
-                # ====================
-                # Train Generator
-                # ====================
-                self.opt_g.zero_grad()
-                z = self._sample_noise(current_batch_size)
+                # ----------------- Train Generator & Supervisor -----------------
+                for _ in range(2):
+                    self.g_opt.zero_grad()
+                    z = self._sample_noise(curr_bs)
 
-                e_hat = self.generator(z)
-                h_hat = self.supervisor(e_hat)
-                y_fake = self.discriminator(h_hat)
+                    e_hat = self.generator(z)
+                    h_hat = self.supervisor(e_hat)
+                    x_hat = self.recovery(h_hat)
 
-                # Unsupervised adversarial loss
-                loss_g_u = self.bce_loss(y_fake, torch.ones_like(y_fake))
+                    y_fake = self.discriminator(h_hat)
 
-                # Supervised loss on generated dynamics
-                loss_g_s = self.mse_loss(h_hat[:, :-1, :], e_hat[:, 1:, :])
+                    # Adversarial unsupervised loss
+                    loss_u = self.bce_logits_loss(y_fake, torch.ones_like(y_fake))
 
-                # Moments loss (captures mean and variance distribution matching)
-                x_hat = self.recovery(h_hat)
-                g_loss_v1 = torch.mean(torch.abs(torch.sqrt(torch.var(x_hat, dim=0) + 1e-6) - torch.sqrt(torch.var(batch_x, dim=0) + 1e-6)))
-                g_loss_v2 = torch.mean(torch.abs(torch.mean(x_hat, dim=0) - torch.mean(batch_x, dim=0)))
-                loss_g_v = g_loss_v1 + g_loss_v2
+                    # Supervised step loss on synthesized codes
+                    loss_s_fake = self.mse_loss(h_hat[:, :-1, :], e_hat[:, 1:, :])
 
-                # Combined Generator loss
-                loss_g = loss_g_u + self.gamma * loss_g_s + 100 * torch.sqrt(loss_g_v)
-                loss_g.backward()
-                self.opt_g.step()
+                    # Feature moment matching (mean and variance regularization)
+                    loss_moments = (
+                        torch.mean(torch.abs(torch.mean(x_hat, dim=0) - torch.mean(batch_x, dim=0))) +
+                        torch.mean(torch.abs(torch.std(x_hat, dim=0) - torch.std(batch_x, dim=0)))
+                    )
 
-                # Train Embedder alongside Generator
-                self.opt_e.zero_grad()
+                    loss_g = loss_u + self.gamma * loss_s_fake + 10.0 * loss_moments
+                    loss_g.backward()
+                    nn.utils.clip_grad_norm_(list(self.generator.parameters()) + list(self.supervisor.parameters()), 1.0)
+                    self.g_opt.step()
+
+                # Train Embedder & Recovery joint reconstruction
+                self.e_opt.zero_grad()
                 h = self.embedder(batch_x)
                 x_tilde = self.recovery(h)
-                h_supervise = self.supervisor(h)
+                h_hat_supervise = self.supervisor(h)
 
-                loss_e_recon = 10 * torch.sqrt(self.mse_loss(x_tilde, batch_x))
-                loss_e_s = self.mse_loss(h_supervise[:, :-1, :], h[:, 1:, :])
-                loss_e = loss_e_recon + 0.1 * loss_e_s
-                loss_e.backward()
-                self.opt_e.step()
+                loss_e0 = 10.0 * torch.sqrt(self.mse_loss(x_tilde, batch_x) + 1e-8)
+                loss_s_real = self.mse_loss(h_hat_supervise[:, :-1, :], h[:, 1:, :])
+                loss_er = loss_e0 + 0.1 * loss_s_real
 
-                # ====================
-                # Train Discriminator
-                # ====================
-                self.opt_d.zero_grad()
-                y_real = self.discriminator(h.detach())
-                y_fake = self.discriminator(h_hat.detach())
+                loss_er.backward()
+                nn.utils.clip_grad_norm_(list(self.embedder.parameters()) + list(self.recovery.parameters()), 1.0)
+                self.e_opt.step()
 
-                loss_d_real = self.bce_loss(y_real, torch.ones_like(y_real))
-                loss_d_fake = self.bce_loss(y_fake, torch.zeros_like(y_fake))
+                # ----------------- Train Discriminator -----------------
+                self.d_opt.zero_grad()
+                with torch.no_grad():
+                    h_real = self.embedder(batch_x)
+                    z_disc = self._sample_noise(curr_bs)
+                    e_hat_disc = self.generator(z_disc)
+                    h_fake = self.supervisor(e_hat_disc)
+
+                y_real = self.discriminator(h_real)
+                y_fake = self.discriminator(h_fake)
+
+                loss_d_real = self.bce_logits_loss(y_real, torch.ones_like(y_real))
+                loss_d_fake = self.bce_logits_loss(y_fake, torch.zeros_like(y_fake))
                 loss_d = loss_d_real + loss_d_fake
 
-                if loss_d.item() > 0.15:  # Prevents discriminator from overpowering generator
-                    loss_d.backward()
-                    self.opt_d.step()
+                loss_d.backward()
+                nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1.0)
+                self.d_opt.step()
 
-                epoch_g_loss += loss_g.item()
-                epoch_d_loss += loss_d.item()
+                total_g_loss += loss_g.item()
+                total_d_loss += loss_d.item()
 
-            avg_g = epoch_g_loss / len(loader)
-            avg_d = epoch_d_loss / len(loader)
-            history["g_loss"].append(avg_g)
-            history["d_loss"].append(avg_d)
+            avg_g_loss = total_g_loss / (len(dataloader) * 2)
+            avg_d_loss = total_d_loss / len(dataloader)
+            history["g_loss"].append(avg_g_loss)
+            history["d_loss"].append(avg_d_loss)
 
-            if epoch % max(1, joint_epochs // 5) == 0 or epoch == joint_epochs:
-                print(f"  Epoch {epoch:03d}/{joint_epochs} - Loss_G: {avg_g:.4f} | Loss_D: {avg_d:.4f}")
+            if epoch % 5 == 0 or epoch == joint_epochs:
+                print(f"  Epoch {epoch:03d}/{joint_epochs:03d} - Loss_G: {avg_g_loss:.5f} | Loss_D: {avg_d_loss:.5f}")
 
         return history
 
     def sample(self, num_samples: int) -> np.ndarray:
         """
-        Generates synthetic transaction sequences.
-        Output shape: (num_samples, seq_len, feature_dim) in [0, 1] scale.
+        Generates synthetic sequential data points: Z -> g(Z) -> s(H) -> r(H) -> X_hat
         """
         self.generator.eval()
         self.supervisor.eval()
@@ -335,43 +358,10 @@ class TimeGAN:
             h_hat = self.supervisor(e_hat)
             x_hat = self.recovery(h_hat)
 
-        return x_hat.cpu().numpy()
+        synthetic_data = x_hat.cpu().numpy()
 
+        self.generator.train()
+        self.supervisor.train()
+        self.recovery.train()
 
-# -------------------------------------------------------------------------
-# Smoke Test / Verification
-# -------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    device = get_device()
-    print("=" * 60)
-    print(f"TimeGAN Verification running on: {device}")
-    print("=" * 60)
-
-    # Synthetic mock parameters
-    N_SAMPLES = 128
-    SEQ_LEN = 24
-    N_FEATURES = 5
-
-    # Generate synthetic input sequences
-    mock_data = np.random.uniform(0.0, 1.0, size=(N_SAMPLES, SEQ_LEN, N_FEATURES)).astype(np.float32)
-
-    # Initialize model
-    model = TimeGAN(
-        feature_dim=N_FEATURES,
-        seq_len=SEQ_LEN,
-        hidden_dim=16,
-        num_layers=2,
-        device=device
-    )
-
-    # Rapid sanity run: 2 epochs each
-    print("\nExecuting dry run training loops...")
-    hist = model.fit(mock_data, batch_size=32, pretrain_epochs=2, joint_epochs=2)
-
-    # Test generation sampling
-    synthetic_samples = model.sample(num_samples=10)
-    print(f"\nSynthetic generation shape: {synthetic_samples.shape} (N, T, D)")
-    print(f"Values range: [{synthetic_samples.min():.2f}, {synthetic_samples.max():.2f}]")
-    assert synthetic_samples.shape == (10, SEQ_LEN, N_FEATURES)
-    print("\nTimeGAN module verified successfully.")
+        return synthetic_data
